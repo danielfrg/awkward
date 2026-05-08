@@ -664,6 +664,60 @@ def awkward_reduce_countnonzero(
     )
 
 
+def awkward_reduce_countnonzero_complex(
+    result,
+    input_data,
+    parents_data,
+    parents_length,
+    outlength,
+):
+    # Complex values arrive as a flat float32/float64 array of length 2*N
+    # (real/imag interleaved). Caller in _reducers.py views complex128 -> float64
+    # (or complex64 -> float32). We re-view back to complex so the segment
+    # reducer can test `c != 0` directly; a complex value is non-zero iff its
+    # real or imag component is non-zero, matching the CPU kernel exactly.
+    if input_data.dtype == cp.float32:
+        complex_dtype = cp.complex64
+    else:
+        complex_dtype = cp.complex128
+
+    input_complex = input_data.view(complex_dtype)
+
+    index_dtype = parents_data.dtype
+
+    def segment_reduce_count_nonzero(segment_id):
+        if segment_id > offsets_len:
+            # (when we will pass offsets directly, this won't be needed)
+            return 0
+        start_idx = start_o[segment_id]
+        end_idx = end_o[segment_id]
+        count = 0
+        for i in range(start_idx, end_idx):
+            c = input_complex[i]
+            if c.real != 0 or c.imag != 0:
+                count += 1
+        return count
+
+    # Prepare the start and end offsets
+    # TODO: This should at least be starts_to_offsets
+    offsets = parents_to_offsets(parents_data, parents_length)
+    start_o = offsets[:-1]
+    end_o = offsets[1:]
+    offsets_len = len(offsets) - 2
+
+    # Perform the segmented reduce
+    # type_wrapper: cp.int64
+    type_wrapper = cp.dtype(index_dtype).type
+    segment_ids = CountingIterator(type_wrapper(0))
+    # TODO: try using segmented_reduce instead when https://github.com/NVIDIA/cccl/issues/6171 is fixed
+    unary_transform(
+        d_in=segment_ids,
+        d_out=result,
+        op=segment_reduce_count_nonzero,
+        num_items=outlength,
+    )
+
+
 def awkward_index_rpad_and_clip_axis0(toindex, target, length):
     """
     Fill ``toindex[0..target)`` with the identity mapping ``[0..shorter)``
